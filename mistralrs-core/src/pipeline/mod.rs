@@ -2116,6 +2116,13 @@ pub trait Pipeline:
 
                 if raw_out_logits[0][0].is_some() {
                     let start = Instant::now();
+                    // A hidden-state request is a finished prefill: cache it so later requests
+                    // sharing its prompt (e.g. one question branch per shared state) skip it.
+                    if self.output_hidden_states() {
+                        for seq in input_seqs.iter_mut() {
+                            sampling::cache_finished_sequence(self, prefix_cacher, seq)?;
+                        }
+                    }
                     response::send_raw_responses(
                         input_seqs,
                         raw_out_logits
@@ -2307,13 +2314,30 @@ pub trait Pipeline:
                 let scheduler_visible_prompt_step = scheduled_prompt_chunks.is_some();
                 let scheduler_visible_prompt_is_final =
                     scheduler_visible_prompt_step && metadata.is_final_prompt_chunk;
+                // Hidden-state output reads every chunk's rows, so it may chunk like a normal prompt.
+                // Hybrid models can only checkpoint recurrent state between forwards, so it always
+                // gets a plan: at least one split at the last block boundary, which is what a later
+                // request sharing this prompt as a prefix (a question branch) restores from.
+                let hidden_prompt = return_raw_logits && self.output_hidden_states();
                 let chunk_size = if !scheduler_visible_prompt_step
                     && is_prompt
-                    && !return_raw_logits
+                    && (!return_raw_logits || hidden_prompt)
                     && !self.get_metadata().is_xlora
-                    && self.device().is_cuda()
                 {
-                    metadata.prompt_chunk_size
+                    if hidden_prompt && self.cache().is_hybrid() {
+                        // Unchunked: one chunk per prompt (the longest one bounds it), still split at
+                        // the checkpoint boundary by the plan.
+                        let longest = input_seqs
+                            .iter()
+                            .map(|seq| seq.get_toks().len())
+                            .max()
+                            .unwrap_or(1);
+                        Some(metadata.prompt_chunk_size.unwrap_or(longest))
+                    } else if self.device().is_cuda() {
+                        metadata.prompt_chunk_size
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
@@ -2342,7 +2366,8 @@ pub trait Pipeline:
                 let hybrid_recurrent = self.cache().is_hybrid();
                 let prefix_policy = self.speculative_prefix_checkpoint_policy();
                 let keep_complete_packed_candidates = chunk_size.is_some_and(|chunk_size| {
-                    input_seqs.len() > 1
+                    !hidden_prompt
+                        && input_seqs.len() > 1
                         && self.supports_packed_prefill()
                         && input_seqs
                             .iter()

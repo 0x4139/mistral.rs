@@ -918,7 +918,7 @@ impl PagedAttentionScheduler {
             let seq_guard = get_mut_arcmutex!(seq);
             let seq_id = *seq_guard.id();
             let num_tokens = seq_guard.get_toks().len();
-            let return_raw_logits = seq_guard.return_raw_logits;
+            let needs_full_raw_prompt = seq_guard.needs_full_raw_prompt();
             let new_seq_modality = modality_signature(&seq_guard);
             let lazy_prompt_allocation = self.supports_scheduler_visible_prompt_chunks(&seq_guard);
             drop(seq_guard);
@@ -965,7 +965,7 @@ impl PagedAttentionScheduler {
 
             // Look up prefix cache hits
             let kv_mgr = get_mut_arcmutex!(self.kv_cache_manager);
-            let mut computed = if self.prefix_caching_enabled && !return_raw_logits {
+            let mut computed = if self.prefix_caching_enabled && !needs_full_raw_prompt {
                 kv_mgr.get_computed_blocks(block_hashes, num_tokens)
             } else {
                 super::kv_cache_manager::ComputedBlocks {

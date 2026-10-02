@@ -265,7 +265,10 @@ pub(crate) fn build_prompt_chunk_plan(
             .map(|feature| feature.offset)
             .min()
             .unwrap_or(total_len);
-        let mut end = (pos + chunk_size).min(next_feature_start).min(total_len);
+        let mut end = pos
+            .saturating_add(chunk_size)
+            .min(next_feature_start)
+            .min(total_len);
         if let Some(block_size) = block_align.filter(|size| *size > 0) {
             let aligned = end / block_size * block_size;
             if aligned > pos && aligned < end {
