@@ -1744,7 +1744,8 @@ impl Engine {
                                         let boundary =
                                             full_len.saturating_sub(1) / block_size * block_size;
                                         if seq.return_hidden_states
-                                            && boundary > seq.num_computed_tokens()
+                                            && seq.num_computed_tokens() == 0
+                                            && boundary > 0
                                         {
                                             full_len - boundary
                                         } else {

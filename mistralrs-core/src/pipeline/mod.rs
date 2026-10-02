@@ -2118,9 +2118,12 @@ pub trait Pipeline:
                     let start = Instant::now();
                     // A hidden-state request is a finished prefill: cache it so later requests
                     // sharing its prompt (e.g. one question branch per shared state) skip it.
+                    // Requests that already extended a cached prefix are leaves; skip those.
                     if self.output_hidden_states() {
                         for seq in input_seqs.iter_mut() {
-                            sampling::cache_finished_sequence(self, prefix_cacher, seq)?;
+                            if seq.prefix_cache_len() == 0 {
+                                sampling::cache_finished_sequence(self, prefix_cacher, seq)?;
+                            }
                         }
                     }
                     response::send_raw_responses(
@@ -2365,6 +2368,12 @@ pub trait Pipeline:
                     .any(|seq| seq.has_suffix_only_prefill_toks());
                 let hybrid_recurrent = self.cache().is_hybrid();
                 let prefix_policy = self.speculative_prefix_checkpoint_policy();
+                // A hidden-state prompt that already restored a cached prefix (a question branch
+                // after its state) is not split again: nothing will extend it, and the extra
+                // forward and snapshot would only cost time.
+                let checkpoints_recurrent_prefix = |seq: &Sequence| {
+                    hybrid_recurrent && !(hidden_prompt && seq.prefix_cache_len() > 0)
+                };
                 let keep_complete_packed_candidates = chunk_size.is_some_and(|chunk_size| {
                     !hidden_prompt
                         && input_seqs.len() > 1
@@ -2380,7 +2389,6 @@ pub trait Pipeline:
                             && !has_suffix_only_prefill
                             && !keep_complete_packed_candidates)
                             .then(|| {
-                                let block_align = hybrid_recurrent.then_some(block_size);
                                 chunk_size.map(|chunk_size| {
                                     input_seqs
                                         .iter()
@@ -2389,7 +2397,8 @@ pub trait Pipeline:
                                                 seq.get_toks().len(),
                                                 seq.prefix_cache_len(),
                                                 chunk_size,
-                                                block_align,
+                                                checkpoints_recurrent_prefix(seq)
+                                                    .then_some(block_size),
                                                 prefix_policy.replay_for(
                                                     crate::scheduler::modality_signature(seq),
                                                 ),
@@ -2437,7 +2446,7 @@ pub trait Pipeline:
                                 recurrent_checkpoint_boundary(
                                     tokens.len(),
                                     *prefix_len,
-                                    hybrid_recurrent.then_some(block_size),
+                                    checkpoints_recurrent_prefix(seq).then_some(block_size),
                                     prefix_policy
                                         .replay_for(crate::scheduler::modality_signature(seq)),
                                     seq.mm_features(),

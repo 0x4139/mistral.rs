@@ -375,7 +375,7 @@ impl PagedAttentionScheduler {
             let require_uniform_length = self.requires_uniform_prompt_batch
                 || candidates.iter().any(|seq| {
                     let seq = get_mut_arcmutex!(seq);
-                    seq.return_raw_logits || seq.prefix_cache_len() > 0
+                    seq.needs_full_raw_prompt() || seq.prefix_cache_len() > 0
                 });
             let scheduled = self.bucket_and_preempt_sequences(
                 candidates,
@@ -769,7 +769,7 @@ impl PagedAttentionScheduler {
                 } else {
                     0
                 },
-                seq_guard.return_raw_logits.then_some(*seq_guard.id()),
+                seq_guard.needs_full_raw_prompt().then_some(*seq_guard.id()),
                 if self.requires_uniform_media_batch
                     || require_uniform_length && matches!(batch_kind, BatchKind::Prompt)
                 {
