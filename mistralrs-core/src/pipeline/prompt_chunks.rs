@@ -697,6 +697,35 @@ mod tests {
     }
 
     #[test]
+    fn unchunked_plan_splits_only_at_the_recurrent_checkpoint() {
+        // One chunk as large as the prompt (or larger) still ends at the block-aligned
+        // checkpoint, so a hybrid model leaves a reusable recurrent prefix behind.
+        for chunk_size in [2062, usize::MAX] {
+            let plan = build_prompt_chunk_plan(
+                2062,
+                0,
+                chunk_size,
+                Some(32),
+                SpeculativePrefixReplay::NotRequired,
+                &[],
+            );
+            let spans = plan.iter().map(|c| (c.start, c.end)).collect::<Vec<_>>();
+            assert_eq!(spans, vec![(0, 2048), (2048, 2062)]);
+        }
+        // A cached prefix shifts the start; the split stays on the last block boundary.
+        let plan = build_prompt_chunk_plan(
+            2184,
+            2048,
+            2184,
+            Some(32),
+            SpeculativePrefixReplay::NotRequired,
+            &[],
+        );
+        let spans = plan.iter().map(|c| (c.start, c.end)).collect::<Vec<_>>();
+        assert_eq!(spans, vec![(2048, 2176), (2176, 2184)]);
+    }
+
+    #[test]
     fn full_replay_has_no_recurrent_checkpoint_boundary() {
         assert_eq!(
             recurrent_checkpoint_boundary(65_536, 0, Some(32), SpeculativePrefixReplay::Full, &[],),

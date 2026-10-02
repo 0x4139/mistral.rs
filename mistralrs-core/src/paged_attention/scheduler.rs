@@ -2904,6 +2904,36 @@ mod tests {
     }
 
     #[test]
+    fn hidden_state_prompt_reuses_prefix_blocks() {
+        let mut scheduler = test_scheduler();
+        let tokens = vec![1; 16];
+        let hashes = compute_block_hashes(&tokens, scheduler.block_size, &[], &[]);
+        {
+            let mut kv_mgr = get_mut_arcmutex!(scheduler.kv_cache_manager);
+            assert!(kv_mgr.allocate_slots(99, tokens.len(), &[]).is_some());
+            kv_mgr.cache_blocks(99, &hashes, scheduler.block_size);
+            kv_mgr.free(99);
+        }
+
+        // A hidden-state request only needs its uncached tail, so unlike plain raw logits it
+        // takes the prefix hit.
+        let hidden = test_sequence(0, tokens.len());
+        get_mut_arcmutex!(hidden).return_raw_logits = true;
+        get_mut_arcmutex!(hidden).return_hidden_states = true;
+        get_mut_arcmutex!(hidden).set_state(SequenceState::Waiting);
+        scheduler.waiting.push_back(hidden);
+
+        let logger = IntervalLogger::new(std::time::Duration::from_secs(3600), None);
+        let output = scheduler.schedule(&logger, None);
+
+        assert_eq!(output.num_cached_tokens, vec![scheduler.block_size]);
+        assert_eq!(
+            get_mut_arcmutex!(output.scheduled[0]).prefix_cache_len(),
+            scheduler.block_size
+        );
+    }
+
+    #[test]
     fn preempted_prefix_cache_hit_is_counted_once() {
         let mut scheduler = test_scheduler();
         let tokens = vec![1; 16];
