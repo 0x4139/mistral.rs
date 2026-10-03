@@ -410,6 +410,7 @@ async fn run_single_bench(
         logits_processors: None,
         return_raw_logits: false,
         max_prefix_reuse: None,
+        max_raw_rows: None,
         web_search_options: None,
         enable_code_execution: false,
         enable_shell: false,

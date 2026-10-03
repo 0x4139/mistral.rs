@@ -2102,10 +2102,10 @@ pub trait Pipeline:
                             // rows of this sequence's own tokens (after a prefix-cache hit these
                             // are just the uncached tail).
                             let rows = input_seqs[seq_idx].get_toks().len();
-                            raw_out_logits[seq_idx][i] = Some(trim_raw_rows(
-                                logits.i(logit_idx)?.to_device(&Device::Cpu)?,
-                                rows,
-                            )?);
+                            // Stays on the device: `send_raw_responses` trims to the rows the
+                            // request asked for before copying to the host.
+                            raw_out_logits[seq_idx][i] =
+                                Some(trim_raw_rows(logits.i(logit_idx)?, rows)?);
                         } else if let ForwardInputsResult::Embeddings { embeddings } = &raw_logits {
                             embedding_logits[seq_idx] =
                                 Some(embeddings.i(logit_idx)?.to_device(&Device::Cpu)?);
@@ -2719,8 +2719,7 @@ pub trait Pipeline:
 
                         for (logit_idx, seq_idx) in seq_indices.into_iter().enumerate() {
                             if let ForwardInputsResult::RawLogits { logits } = &raw_logits {
-                                raw_out_logits[seq_idx][i] =
-                                    Some(logits.i(logit_idx)?.to_device(&Device::Cpu)?);
+                                raw_out_logits[seq_idx][i] = Some(logits.i(logit_idx)?);
                             } else if let ForwardInputsResult::Embeddings { embeddings } =
                                 &raw_logits
                             {

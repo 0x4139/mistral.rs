@@ -1,7 +1,7 @@
 use std::{io::Cursor, sync::Arc};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use candle_core::Tensor;
+use candle_core::{Device, Tensor};
 use image::DynamicImage;
 use uuid::Uuid;
 
@@ -105,6 +105,34 @@ pub async fn send_speech_responses(
     Ok(())
 }
 
+/// The last `max` rows across a sequence's raw chunks (rows are the second-to-last axis), still on
+/// their device; `None` keeps every row.
+pub(crate) fn keep_last_rows(
+    chunks: Vec<Tensor>,
+    max: Option<usize>,
+) -> candle_core::Result<Vec<Tensor>> {
+    let Some(mut left) = max else {
+        return Ok(chunks);
+    };
+    let mut kept = Vec::new();
+    for t in chunks.into_iter().rev() {
+        if left == 0 {
+            break;
+        }
+        let axis = t.rank().saturating_sub(2);
+        let rows = t.dim(axis)?;
+        if rows <= left {
+            left -= rows;
+            kept.push(t);
+        } else {
+            kept.push(t.narrow(axis, rows - left, left)?);
+            left = 0;
+        }
+    }
+    kept.reverse();
+    Ok(kept)
+}
+
 pub async fn send_raw_responses(
     input_seqs: &mut [&mut Sequence],
     logits_chunks: Vec<Vec<Tensor>>,
@@ -118,6 +146,10 @@ pub async fn send_raw_responses(
     }
     for (seq, chunks) in input_seqs.iter_mut().zip(logits_chunks) {
         let seq: &mut Sequence = seq;
+        let chunks = keep_last_rows(chunks, seq.max_raw_rows)?
+            .into_iter()
+            .map(|t| t.to_device(&Device::Cpu))
+            .collect::<candle_core::Result<Vec<_>>>()?;
         seq.add_raw_choice_to_group(chunks);
 
         let group = seq.get_mut_group();
@@ -153,4 +185,47 @@ pub async fn send_embedding_responses(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod raw_rows_tests {
+    use super::keep_last_rows;
+    use candle_core::{Device, Tensor};
+
+    fn rows(n: usize, start: f32) -> Tensor {
+        let values: Vec<f32> = std::iter::successors(Some(start), |v| Some(v + 1.0))
+            .take(n)
+            .collect();
+        Tensor::from_vec(values, (1, n, 1), &Device::Cpu).unwrap()
+    }
+
+    fn values(chunks: &[Tensor]) -> Vec<f32> {
+        chunks
+            .iter()
+            .flat_map(|t| t.flatten_all().unwrap().to_vec1::<f32>().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn keeps_every_row_without_a_cap() {
+        let kept = keep_last_rows(vec![rows(3, 0.0), rows(2, 3.0)], None).unwrap();
+        assert_eq!(values(&kept), [0.0, 1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn keeps_the_last_rows_across_chunks() {
+        let kept = keep_last_rows(vec![rows(3, 0.0), rows(2, 3.0)], Some(3)).unwrap();
+        assert_eq!(values(&kept), [2.0, 3.0, 4.0]);
+        let kept = keep_last_rows(vec![rows(3, 0.0), rows(2, 3.0)], Some(1)).unwrap();
+        assert_eq!(values(&kept), [4.0]);
+        let kept = keep_last_rows(vec![rows(3, 0.0), rows(2, 3.0)], Some(9)).unwrap();
+        assert_eq!(values(&kept), [0.0, 1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn zero_rows_returns_nothing() {
+        assert!(keep_last_rows(vec![rows(3, 0.0)], Some(0))
+            .unwrap()
+            .is_empty());
+    }
 }

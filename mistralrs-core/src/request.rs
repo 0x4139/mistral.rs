@@ -412,6 +412,7 @@ impl WebSearchOptions {
 ///     4) Sample the next token (topk, topp, minp, etc)
 /// - `return_raw_logits`: Return raw logits.
 /// - `max_prefix_reuse`: Reuse at most this many prompt tokens from the prefix cache.
+/// - `max_raw_rows`: With `return_raw_logits`, return only the last this many prompt rows.
 /// - `truncate_sequence`: Whether to truncate the prompt if it exceeds the model's maximum context length.
 pub struct NormalRequest {
     pub messages: RequestMessage,
@@ -440,6 +441,11 @@ pub struct NormalRequest {
     /// sequence that covers those positions can never hide them. `None` means no limit.
     #[serde(default)]
     pub max_prefix_reuse: Option<usize>,
+    /// With `return_raw_logits`, return only the last this many prompt rows (`Some(0)`: none, e.g.
+    /// a request that only fills the prefix cache). Rows are trimmed on the device, before the copy
+    /// to the host. `None` returns every computed row.
+    #[serde(default)]
+    pub max_raw_rows: Option<usize>,
     pub web_search_options: Option<WebSearchOptions>,
     /// When true, registered code-execution tools are injected and the agentic loop runs.
     #[serde(default)]
@@ -523,6 +529,7 @@ impl NormalRequest {
             logits_processors: None,
             return_raw_logits: false,
             max_prefix_reuse: None,
+            max_raw_rows: None,
             web_search_options: None,
             enable_code_execution: false,
             enable_shell: false,

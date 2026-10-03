@@ -114,6 +114,7 @@ async fn hidden_rows(
         logits_processors: None,
         return_raw_logits: true,
         max_prefix_reuse: max_reuse,
+        max_raw_rows: None,
         web_search_options: None,
         enable_code_execution: false,
         enable_shell: false,

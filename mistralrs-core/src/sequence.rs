@@ -772,6 +772,8 @@ pub struct Sequence {
     pub(crate) return_hidden_states: bool,
     /// Reuse at most this many leading prompt tokens from the prefix cache (`None`: no limit).
     pub(crate) max_prefix_reuse: Option<usize>,
+    /// Raw rows to return, counted from the end of the prompt (`max_raw_rows`).
+    pub(crate) max_raw_rows: Option<usize>,
     token_offset: usize,
     eos_tokens: Vec<u32>,
     adapter: Option<AdapterLease>,
@@ -969,6 +971,7 @@ impl Sequence {
             return_raw_logits,
             return_hidden_states: false,
             max_prefix_reuse: None,
+            max_raw_rows: None,
             token_offset: 0,
             eos_tokens,
             adapter: None,

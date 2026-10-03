@@ -794,6 +794,7 @@ impl Engine {
             seq.return_hidden_states =
                 seq.return_raw_logits && get_mut_arcmutex!(self.pipeline).output_hidden_states();
             seq.max_prefix_reuse = request.max_prefix_reuse;
+            seq.max_raw_rows = request.max_raw_rows;
             if let Some(adapter_lease) = &adapter_lease {
                 seq.bind_adapter(adapter_lease.clone());
             }
