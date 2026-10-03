@@ -42,6 +42,9 @@ struct Args {
     /// Disable the prefix cache.
     #[arg(long)]
     no_prefix_cache: bool,
+    /// In-situ quantization of the GGUF weights, e.g. `fp8` (F8E4M3).
+    #[arg(long)]
+    isq: Option<String>,
     /// Run on the CPU.
     #[arg(long)]
     cpu: bool,
@@ -163,6 +166,14 @@ async fn main() -> Result<()> {
         .with_dtype(dtype)
         .with_hidden_states_output()
         .with_logging();
+    if let Some(isq) = &args.isq {
+        let ty = match isq.as_str() {
+            "fp8" => mistralrs::IsqType::F8E4M3,
+            "q8_0" => mistralrs::IsqType::Q8_0,
+            other => anyhow::bail!("unknown isq {other}"),
+        };
+        builder = builder.with_isq(ty);
+    }
     if args.cpu {
         builder = builder.with_force_cpu();
     }
