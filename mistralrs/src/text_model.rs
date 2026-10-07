@@ -58,6 +58,7 @@ pub struct TextModelBuilder {
     pub(crate) no_kv_cache: bool,
     pub(crate) with_logging: bool,
     pub(crate) prefix_cache_n: Option<usize>,
+    pub(crate) output_hidden_states: bool,
 }
 
 /// Builder for PagedAttention metadata.
@@ -160,6 +161,7 @@ impl TextModelBuilder {
             device: None,
             matformer_config_path: None,
             matformer_slice_name: None,
+            output_hidden_states: false,
         }
     }
 
@@ -229,9 +231,27 @@ impl TextModelBuilder {
         self
     }
 
+    /// Return final-norm hidden states instead of logits. Use
+    /// [`Model::send_raw_chat_request`] (or a raw `NormalRequest`): each chunk then holds
+    /// `[tokens, hidden_size]` f32 hidden states for the prompt tokens not served from the prefix
+    /// cache. Generation requests are not meaningful in this mode. Works for plain and UQFF
+    /// models; currently supported for Qwen3.5.
+    pub fn with_hidden_states_output(mut self) -> Self {
+        self.output_hidden_states = true;
+        self
+    }
+
     /// Load the text model and return a ready-to-use [`Model`].
     pub async fn build(self) -> anyhow::Result<Model> {
+        let output_hidden_states = self.output_hidden_states;
         let (pipeline, scheduler_config, add_model_config) = build_text_pipeline(self).await?;
+        if output_hidden_states {
+            pipeline
+                .lock()
+                .await
+                .set_output_hidden_states(true)
+                .map_err(anyhow::Error::msg)?;
+        }
         Ok(build_model_from_pipeline(pipeline, scheduler_config, add_model_config).await)
     }
 }
@@ -286,5 +306,25 @@ impl DerefMut for UqffTextModelBuilder {
 impl From<UqffTextModelBuilder> for TextModelBuilder {
     fn from(value: UqffTextModelBuilder) -> Self {
         value.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TextModelBuilder, UqffTextModelBuilder};
+
+    #[test]
+    fn hidden_states_output_is_off_by_default_and_set_by_the_builder() {
+        assert!(!TextModelBuilder::new("model").output_hidden_states);
+        assert!(
+            TextModelBuilder::new("model")
+                .with_hidden_states_output()
+                .output_hidden_states
+        );
+        let uqff = UqffTextModelBuilder::new("dir", vec!["model-Q8_0-0.uqff".into()])
+            .into_inner()
+            .with_hidden_states_output();
+        assert!(uqff.output_hidden_states);
+        assert!(uqff.from_uqff.is_some());
     }
 }
