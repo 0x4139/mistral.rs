@@ -1,4 +1,5 @@
-//! Read final-norm hidden states at chosen token positions from a GGUF model.
+//! Read final-norm hidden states at chosen token positions from a GGUF, UQFF or plain
+//! (safetensors) model.
 //!
 //! Input JSON: `{"rows": [{"ids": [u32, ..], "positions": [usize, ..]}, ..]}` where positions
 //! index into `ids`. Output JSON: `{"rows": [{"hidden": [[f32; hidden_size], ..]}, ..]}`, one
@@ -9,6 +10,8 @@
 //!
 //! Run with: `cargo run --release --features cuda --example hidden_states -p mistralrs -- \
 //!   --model-dir DIR --file model.gguf --input rows.json --output hidden.json`
+//! (`--format uqff --file model-Q8_0-0.uqff` for UQFF, `--format plain` without `--file` for a
+//! safetensors model directory).
 
 use std::{fs, time::Instant};
 
@@ -17,19 +20,22 @@ use candle_core::IndexOp;
 use clap::Parser;
 use mistralrs::{
     Constraint, GgufModelBuilder, ModelDType, NormalRequest, Request, RequestMessage, ResponseOk,
-    SamplingParams, Tensor,
+    SamplingParams, Tensor, TextModelBuilder, UqffTextModelBuilder,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::channel;
 
 #[derive(Parser)]
 struct Args {
-    /// Directory holding the GGUF file.
+    /// Directory holding the model files.
     #[arg(long)]
     model_dir: String,
-    /// GGUF filename inside `model_dir`.
+    /// Model format: gguf, uqff or plain (safetensors directory).
+    #[arg(long, default_value = "gguf")]
+    format: String,
+    /// GGUF or UQFF filename inside `model_dir` (not used for `plain`).
     #[arg(long)]
-    file: String,
+    file: Option<String>,
     /// Input rows (JSON).
     #[arg(long)]
     input: String,
@@ -160,26 +166,54 @@ async fn main() -> Result<()> {
         "bf16" => ModelDType::BF16,
         other => anyhow::bail!("unknown dtype {other}"),
     };
-    let mut builder = GgufModelBuilder::new(&args.model_dir, vec![args.file.clone()])
-        .with_dtype(dtype)
-        .with_hidden_states_output()
-        .with_logging();
-    if args.cpu {
-        builder = builder.with_force_cpu();
-    }
-    if args.no_prefix_cache {
-        builder = builder.with_prefix_cache_n(None);
-    }
-    if args.paged_ctx > 0 {
+    let paged = if args.paged_ctx > 0 {
         let mut paged = mistralrs::PagedAttentionMetaBuilder::default()
             .with_gpu_memory(mistralrs::MemoryGpuConfig::ContextSize(args.paged_ctx));
         if let Some(bs) = args.block_size {
             paged = paged.with_block_size(bs);
         }
-        builder = builder.with_paged_attn(paged.build()?);
+        Some(paged.build()?)
+    } else {
+        None
+    };
+    // The GGUF and text builders share these options; apply them the same way to either.
+    macro_rules! configure {
+        ($builder:expr) => {{
+            let mut builder = $builder
+                .with_dtype(dtype)
+                .with_hidden_states_output()
+                .with_logging();
+            if args.cpu {
+                builder = builder.with_force_cpu();
+            }
+            if args.no_prefix_cache {
+                builder = builder.with_prefix_cache_n(None);
+            }
+            if let Some(paged) = paged.clone() {
+                builder = builder.with_paged_attn(paged);
+            }
+            builder.with_max_num_seqs(args.max_seqs)
+        }};
     }
-    builder = builder.with_max_num_seqs(args.max_seqs);
-    let model = builder.build().await?;
+    let model = match args.format.as_str() {
+        "gguf" => {
+            let file = args.file.clone().context("--file is required for gguf")?;
+            configure!(GgufModelBuilder::new(&args.model_dir, vec![file]))
+                .build()
+                .await?
+        }
+        "uqff" => {
+            let file = args.file.clone().context("--file is required for uqff")?;
+            let builder = UqffTextModelBuilder::new(&args.model_dir, vec![file.into()]);
+            configure!(builder.into_inner()).build().await?
+        }
+        "plain" => {
+            configure!(TextModelBuilder::new(&args.model_dir))
+                .build()
+                .await?
+        }
+        other => anyhow::bail!("unknown format {other}"),
+    };
 
     let input: Input = serde_json::from_str(&fs::read_to_string(&args.input)?)?;
     let n_rows = input.rows.len();
