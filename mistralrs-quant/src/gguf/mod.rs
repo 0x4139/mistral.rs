@@ -246,7 +246,7 @@ impl GgufMatMul {
             });
             let qt = match vector {
                 Some(v) if imatrix_capable && v.iter().any(|x| *x != 0.0) => {
-                    candle_core::quantized::QTensor::quantize_imatrix(&slab, v, dtype)?
+                    crate::utils::isq::quantize_imatrix_guarded(&slab, v, dtype)?
                 }
                 _ => candle_core::quantized::QTensor::quantize(&slab, dtype)?,
             };
