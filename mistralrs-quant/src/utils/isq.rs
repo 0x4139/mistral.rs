@@ -1,6 +1,9 @@
 use std::sync::{atomic::AtomicUsize, Arc};
 
-use candle_core::{quantized::GgmlDType, DType, Device, Result, Tensor};
+use candle_core::{
+    quantized::{GgmlDType, QTensor},
+    DType, Device, Result, Tensor, D,
+};
 
 use crate::{
     get_immediate_isq, pending_layer, ImmediateIsqMatch, ImmediateIsqParams, IsqConsumer,
@@ -268,6 +271,57 @@ fn can_quantize(tensor: &Tensor, dtype: GgmlDType) -> bool {
     !dims.is_empty() && dims[dims.len() - 1].is_multiple_of(dtype.block_size())
 }
 
+/// Groups whose largest magnitude is below this are quantized as exact zeros
+/// (llama.cpp's `GROUP_MAX_EPS`).
+pub(crate) const GROUP_MAX_EPS: f32 = 1e-15;
+
+/// Sub-block (scale group) length of an importance-weighted K-quant, or `None`
+/// when `dtype` has no imatrix quantizer.
+fn imatrix_group_len(dtype: GgmlDType) -> Option<usize> {
+    match dtype {
+        GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q6K => Some(16),
+        GgmlDType::Q4K | GgmlDType::Q5K => Some(32),
+        _ => None,
+    }
+}
+
+/// `QTensor::quantize_imatrix` with llama.cpp's near-zero group guard.
+///
+/// The importance-weighted K-quant search squares and weights each value. In a
+/// group whose values are all tiny (e.g. ~1e-37 "dead" rows) those products
+/// underflow to 0 and the fitted scale becomes 0/0 = NaN, which poisons the
+/// whole super-block. Groups whose max |x| is below [`GROUP_MAX_EPS`] are
+/// flushed to exact zeros first; the quantizer already maps an all-zero group
+/// to zero scales and zero quants. Tensors without such groups are passed
+/// through untouched, so their output is bit-identical to the unguarded path.
+pub fn quantize_imatrix_guarded(
+    src: &Tensor,
+    imatrix_weights: &[f32],
+    dtype: GgmlDType,
+) -> Result<QTensor> {
+    let n_per_row = src.dim(D::Minus1)?;
+    let Some(group) = imatrix_group_len(dtype).filter(|g| n_per_row.is_multiple_of(*g)) else {
+        return QTensor::quantize_imatrix(src, imatrix_weights, dtype);
+    };
+    let mut xs = src.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let mut flushed = 0usize;
+    for g in xs.chunks_exact_mut(group) {
+        let amax = g.iter().fold(0f32, |m, v| m.max(v.abs()));
+        if amax > 0.0 && amax < GROUP_MAX_EPS {
+            g.fill(0.0);
+            flushed += 1;
+        }
+    }
+    if flushed == 0 {
+        return QTensor::quantize_imatrix(src, imatrix_weights, dtype);
+    }
+    tracing::debug!(
+        "imatrix {dtype:?}: flushed {flushed} near-zero groups (max |x| < {GROUP_MAX_EPS:e}) to zero"
+    );
+    let guarded = Tensor::from_vec(xs, src.shape(), src.device())?;
+    QTensor::quantize_imatrix(&guarded, imatrix_weights, dtype)
+}
+
 /// Check if we should quantize the tensor and if so, with which dtype.
 pub(crate) fn get_quantization_behaviour(
     tensor: &Tensor,
@@ -392,7 +446,7 @@ macro_rules! generate_isq_imatrix {
             dtype,
             GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
         ) {
-            candle_core::quantized::QTensor::quantize_imatrix(&cpu_src, &$imatrix, dtype)?
+            $crate::utils::isq::quantize_imatrix_guarded(&cpu_src, &$imatrix, dtype)?
         } else {
             candle_core::quantized::QTensor::quantize(&cpu_src, dtype)?
         };
@@ -406,4 +460,112 @@ macro_rules! generate_isq_imatrix {
             $tensor.shape(),
         )?)
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IMATRIX_KQUANTS: [GgmlDType; 5] = [
+        GgmlDType::Q2K,
+        GgmlDType::Q3K,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+    ];
+    /// Magnitude of the "dead" rows found in the 0.8B/2B `in_proj_qkv` weights.
+    const DEAD: f32 = 1.175e-37;
+
+    fn imatrix(n: usize) -> Vec<f32> {
+        (0..n).map(|i| 0.5 + (i % 11) as f32 * 0.37).collect()
+    }
+
+    fn normal(n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| (i as f32 * 0.731).sin() * 0.05 + (i as f32 * 0.113).cos() * 0.02)
+            .collect()
+    }
+
+    fn dequant(q: &QTensor) -> Result<Vec<f32>> {
+        q.dequantize(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()
+    }
+
+    #[test]
+    fn dead_blocks_quantize_to_zero() -> Result<()> {
+        let (rows, cols) = (3, 512);
+        let xs: Vec<f32> = (0..rows * cols)
+            .map(|i| DEAD * (1.0 + (i % 5) as f32 * 0.25) * if i % 3 == 0 { -1.0 } else { 1.0 })
+            .collect();
+        let src = Tensor::from_vec(xs, (rows, cols), &Device::Cpu)?;
+        let im = imatrix(cols);
+        for dtype in IMATRIX_KQUANTS {
+            let q = quantize_imatrix_guarded(&src, &im, dtype)?;
+            let ys = dequant(&q)?;
+            assert!(
+                ys.iter().all(|y| *y == 0.0),
+                "{dtype:?}: dead block did not dequantize to exact zeros"
+            );
+        }
+        // the unguarded path is what produced NaN scales for Q4K (issue #61)
+        let raw = dequant(&QTensor::quantize_imatrix(&src, &im, GgmlDType::Q4K)?)?;
+        assert!(
+            raw.iter().any(|y| !y.is_finite()),
+            "repro lost: raw Q4K stayed finite"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_blocks_stay_finite() -> Result<()> {
+        let (rows, cols) = (2, 512);
+        let base = normal(rows * cols);
+        // every other 32-value group of each super-block is dead (a whole scale group
+        // for every K-quant: 32 for Q4K/Q5K, two 16-groups for Q2K/Q3K/Q6K)
+        let xs: Vec<f32> = base
+            .iter()
+            .enumerate()
+            .map(|(i, x)| if (i / 32) % 2 == 0 { DEAD } else { *x })
+            .collect();
+        let src = Tensor::from_vec(xs.clone(), (rows, cols), &Device::Cpu)?;
+        let im = imatrix(cols);
+        for dtype in IMATRIX_KQUANTS {
+            let ys = dequant(&quantize_imatrix_guarded(&src, &im, dtype)?)?;
+            assert!(
+                ys.iter().all(|y| y.is_finite()),
+                "{dtype:?}: non-finite output"
+            );
+            let (mut err, mut sig) = (0f32, 0f32);
+            for (i, (x, y)) in xs.iter().zip(&ys).enumerate() {
+                if (i / 32) % 2 == 0 {
+                    assert!(y.abs() < 1e-30, "{dtype:?}: dead value {i} -> {y}");
+                } else {
+                    err += (x - y) * (x - y);
+                    sig += x * x;
+                }
+            }
+            let rel = (err / sig).sqrt();
+            assert!(
+                rel < 0.6,
+                "{dtype:?}: live values badly quantized (rel rmse {rel})"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn normal_blocks_bit_identical() -> Result<()> {
+        let (rows, cols) = (4, 768);
+        let src = Tensor::from_vec(normal(rows * cols), (rows, cols), &Device::Cpu)?;
+        let im = imatrix(cols);
+        for dtype in IMATRIX_KQUANTS {
+            let guarded = quantize_imatrix_guarded(&src, &im, dtype)?;
+            let raw = QTensor::quantize_imatrix(&src, &im, dtype)?;
+            assert_eq!(
+                guarded.data()?,
+                raw.data()?,
+                "{dtype:?}: normal block changed"
+            );
+        }
+        Ok(())
+    }
 }
