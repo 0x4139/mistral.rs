@@ -30,6 +30,9 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 #include <vector>
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+namespace nvcuda { namespace wmma {} }
+#endif
 using namespace nvcuda::wmma;
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
@@ -85,6 +88,9 @@ __global__ void moe_gemm_grouped_kernel(
     T *__restrict__ output, // [size_m, size_n] (Zero-initialized)
     const int num_experts, const int topk, const int32_t size_m,
     const int32_t size_n, const int32_t size_k) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+  __trap();  // WMMA needs sm_70; MoE kernels are not used on older GPUs
+#else
   // Get Segment and N-Tile for this Block
   const int expert_id = blockIdx.x;
   const int n_tile_idx = blockIdx.y;
@@ -236,6 +242,7 @@ __global__ void moe_gemm_grouped_kernel(
       }
     }
   } // end m_base loop
+#endif
 }
 
 extern "C" void
