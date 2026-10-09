@@ -900,7 +900,7 @@ fn causal_conv1d_update(
     let total_len = hidden_new.dim(2)?;
     for i in (total_len - seq_len)..total_len {
         let window = hidden_new.narrow(2, i + 1 - dims.conv_kernel_size, dims.conv_kernel_size)?;
-        let out = (window * weight.unsqueeze(0)?)?.sum(D::Minus1)?;
+        let out = window.broadcast_mul(&weight.unsqueeze(0)?)?.sum(D::Minus1)?;
         conv_outputs.push(out);
     }
     candle_nn::ops::silu(&Tensor::stack(&conv_outputs, 2)?)?.transpose(1, 2)
@@ -1039,7 +1039,7 @@ fn causal_conv1d_full(
     let mut conv_outputs = Vec::with_capacity(seq_len);
     for i in 0..seq_len {
         let window = padded_t.narrow(2, i, dims.conv_kernel_size)?;
-        let out = (window * weight.unsqueeze(0)?)?.sum(D::Minus1)?;
+        let out = window.broadcast_mul(&weight.unsqueeze(0)?)?.sum(D::Minus1)?;
         conv_outputs.push(out);
     }
     candle_nn::ops::silu(&Tensor::stack(&conv_outputs, 2)?)?.transpose(1, 2)
@@ -1932,6 +1932,77 @@ mod tests {
 
         assert_close(&one_shot, &Tensor::cat(&[first, second], 1)?)?;
         assert_close(&one_shot_cache.conv_state, &chunked_cache.conv_state)
+    }
+
+    // A half-precision prefill on the CPU (a layer offloaded from the GPU) takes the tensor-op
+    // path; with a batch above one it must match the f32 kernel.
+    #[test]
+    fn causal_conv1d_prefill_f16_cpu_batches() -> CandleResult<()> {
+        let dev = Device::Cpu;
+        let dims = dims(2, 4, 5, 3);
+        let (batch_size, seq_len) = (2, 6);
+        let x = Tensor::from_vec(
+            patterned(batch_size * seq_len * dims.conv_dim, 13, 0.08, 0.01),
+            (batch_size, seq_len, dims.conv_dim),
+            &dev,
+        )?;
+        let weight = Tensor::from_vec(
+            patterned(dims.conv_dim * dims.conv_kernel_size, 14, 0.05, -0.01),
+            (dims.conv_dim, 1, dims.conv_kernel_size),
+            &dev,
+        )?;
+        let conv_state = Tensor::from_vec(
+            patterned(
+                batch_size * dims.conv_dim * dims.conv_kernel_size,
+                15,
+                0.03,
+                0.0,
+            ),
+            (batch_size, dims.conv_dim, dims.conv_kernel_size),
+            &dev,
+        )?;
+        let cache = |conv_state: Tensor| -> CandleResult<GdnLayerCache> {
+            Ok(GdnLayerCache {
+                conv_state,
+                recurrent_state: Tensor::zeros(
+                    (
+                        batch_size,
+                        dims.num_v_heads,
+                        dims.head_k_dim,
+                        dims.head_v_dim,
+                    ),
+                    DType::F32,
+                    &dev,
+                )?,
+                state_layout: RecurrentStateLayout::GdnKeyMajor,
+                slots: None,
+                pending_transitions: None,
+                deferred_state: None,
+            })
+        };
+        let mut f32_cache = cache(conv_state.clone())?;
+        let mut f16_cache = cache(conv_state.to_dtype(DType::F16)?)?;
+
+        let reference = causal_conv1d_full(&x, &weight, &dims, &mut f32_cache)?;
+        let half = causal_conv1d_full(
+            &x.to_dtype(DType::F16)?,
+            &weight.to_dtype(DType::F16)?,
+            &dims,
+            &mut f16_cache,
+        )?;
+
+        for (lhs, rhs) in [
+            (half.to_dtype(DType::F32)?, reference),
+            (
+                f16_cache.conv_state.to_dtype(DType::F32)?,
+                f32_cache.conv_state,
+            ),
+        ] {
+            assert_eq!(lhs.shape(), rhs.shape());
+            let diff = (lhs - rhs)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            assert!(diff <= 2e-3, "f16 conv differs from f32 by {diff}");
+        }
+        Ok(())
     }
 
     #[test]
