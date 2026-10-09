@@ -900,7 +900,9 @@ fn causal_conv1d_update(
     let total_len = hidden_new.dim(2)?;
     for i in (total_len - seq_len)..total_len {
         let window = hidden_new.narrow(2, i + 1 - dims.conv_kernel_size, dims.conv_kernel_size)?;
-        let out = window.broadcast_mul(&weight.unsqueeze(0)?)?.sum(D::Minus1)?;
+        let out = window
+            .broadcast_mul(&weight.unsqueeze(0)?)?
+            .sum(D::Minus1)?;
         conv_outputs.push(out);
     }
     candle_nn::ops::silu(&Tensor::stack(&conv_outputs, 2)?)?.transpose(1, 2)
@@ -1039,7 +1041,9 @@ fn causal_conv1d_full(
     let mut conv_outputs = Vec::with_capacity(seq_len);
     for i in 0..seq_len {
         let window = padded_t.narrow(2, i, dims.conv_kernel_size)?;
-        let out = window.broadcast_mul(&weight.unsqueeze(0)?)?.sum(D::Minus1)?;
+        let out = window
+            .broadcast_mul(&weight.unsqueeze(0)?)?
+            .sum(D::Minus1)?;
         conv_outputs.push(out);
     }
     candle_nn::ops::silu(&Tensor::stack(&conv_outputs, 2)?)?.transpose(1, 2)
